@@ -78,6 +78,7 @@ class HybridSearchEngine:
         results.sort(key=lambda x: x["score"], reverse=True)
         return results[:top_k]
 
+
     def search(self, query_str, top_k=5):
 
         # 1. Vector search
@@ -87,14 +88,40 @@ class HybridSearchEngine:
         # 2. Keyword search
         keyword_results = self._keyword_search(query_str, top_k=top_k)
 
-        # 3. Merge and Rerank
-        merged = {}
-        for r in vector_results + keyword_results:
-            if r["id"] not in merged:
-                merged[r["id"]] = r
-            else:
-                merged[r["id"]]["score"] += r["score"] * 0.5
+        # 3. Merge and Rerank using Reciprocal Rank Fusion
+        merged = self._reciprocal_rank_fusion(vector_results, keyword_results)
 
-        sorted_results = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+        vector_ids = {r["id"] for r in vector_results}
+        keyword_ids = {r["id"] for r in keyword_results}
 
-        return sorted_results[:top_k]
+        results = []
+    
+        for item in merged[:top_k]: # tag result for where it was found
+            in_vec = item["id"] in vector_ids
+            in_kw = item["id"] in keyword_ids
+            source = "hybrid" if (in_vec and in_kw) else ("vector" if in_vec else "keyword") 
+            results.append(SearchResult(
+                chunk_id=item["id"],
+                text=item["text"],
+                score=item["score"],
+                source=source
+            ))
+        return results
+
+
+    def _reciprocal_rank_fusion(self, vector_results, keyword_results, k = 60):
+        scores = {}
+        texts = {}
+
+        for rank, result in enumerate(vector_results, 1):
+            scores[result['id']] = 1 / (k + rank) # equation on stage 6
+            texts[result['id']] = result['text']
+
+        for rank, result in enumerate(keyword_results, 1):
+            span_id = result['id']
+            scores[span_id] = scores.get(span_id, 0) + 1 / (k + rank)
+            texts[span_id] = result['text']
+
+        merged = [{"id": sid, "text": texts[sid], "score": score} for sid, score in scores.items()]
+        merged.sort(key=lambda x: x["score"], reverse=True) # sort by descending score
+        return merged
