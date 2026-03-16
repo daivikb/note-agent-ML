@@ -1,1 +1,6 @@
 .env
+ml/cache/
+cache/
+__pycache__/
+ml/__pycache__/
+*.db

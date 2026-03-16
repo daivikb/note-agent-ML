@@ -75,7 +75,24 @@ CREATE TABLE IF NOT EXISTS links (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- 7. Insights Table (Higher Level Intelligence)
+-- 7. Human Reviews Table (HITL Feedback Loop)
+CREATE TABLE IF NOT EXISTS human_reviews (
+    id SERIAL PRIMARY KEY,
+    object_id TEXT NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+    note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    original_type TEXT NOT NULL,
+    corrected_type TEXT,
+    original_text TEXT NOT NULL,
+    corrected_text TEXT,
+    status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'accepted', 'rejected', 'corrected'
+    reviewed_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_human_reviews_status ON human_reviews(status);
+CREATE INDEX IF NOT EXISTS idx_human_reviews_note ON human_reviews(note_id);
+
+-- 8. Insights Table (Higher Level Intelligence)
 CREATE TABLE IF NOT EXISTS insights (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL,

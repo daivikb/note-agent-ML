@@ -8,11 +8,21 @@ Validates the Definition of Done:
 Run: python test_extraction.py
 """
 import os
+import sys
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from ml.extraction import LLMExtractor, ExtractionResult, _attempt_json_repair
+
+# Only reset feedback DB if --reset flag is passed
+if "--reset" in sys.argv:
+    _fb_path = Path(__file__).resolve().parent.parent / "feedback.db"
+    if _fb_path.exists():
+        _fb_path.unlink()
+        print("[Setup] Cleared feedback.db")
+    sys.argv.remove("--reset")
 
 
 def test_json_repair():
@@ -113,12 +123,12 @@ def test_llm_extraction():
     print(f"  ✓ LLMExtractor initialized (model={extractor.model})")
 
     # Test passage (designed to produce Claims AND Ideas)
-    test_text = """Photosynthesis is the process by which plants convert sunlight into energy.
-This process requires water and carbon dioxide.
-Some researchers question whether artificial photosynthesis could replace solar panels.
-Key idea: Bio-inspired solar cells could be the next breakthrough in renewable energy.
-Task: Review the latest papers on artificial photosynthesis efficiency.
-Assumption: Current solar panel technology has reached a performance plateau."""
+    test_text = """Our user retention dropped 12% last quarter, which the data team attributes to
+slow onboarding flows. We should redesign the first-time experience with an interactive
+tutorial instead of static tooltips. Does the mobile team have bandwidth to start this
+before the May release? The PM assumes backend latency won't affect the new flow, but
+that needs validation. If retention doesn't improve by Q3, we may need to reconsider
+the freemium pricing model entirely. Action item: schedule a design sprint next week."""
 
     print(f"\n  ── Input Text ──")
     print(f"  {test_text.strip()}")

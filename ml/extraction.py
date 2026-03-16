@@ -2,11 +2,19 @@ import json
 import os
 import re
 import uuid
+import hashlib
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Literal
 from pydantic import BaseModel, Field, field_validator
 from openai import OpenAI
 from ml.config import config
+from ml.feedback import (
+    init_feedback_db,
+    log_extraction,
+    get_few_shot_examples,
+    format_few_shot_block,
+)
 
 
 @dataclass
@@ -163,7 +171,139 @@ class LLMExtractor:
         self.links_table: List[Link] = []
         self.verbose = verbose
 
+        # HITL: Initialize feedback store and load few-shot examples
+        init_feedback_db()
+        self._few_shot_block = self._build_few_shot_block()
+
+    def _split_into_chunks(self, text: str) -> List[Chunk]:
+        """Split the input text into manageable chunks based on a character limit.
+        This simple heuristic uses a fixed size (e.g., 3000 chars) which works well
+        for most LLM token limits. Adjust as needed.
+        """
+        max_chars = 3000  # Roughly corresponds to typical token limits
+        chunks: List[Chunk] = []
+        start = 0
+        while start < len(text):
+            end = min(start + max_chars, len(text))
+            chunk_text = text[start:end]
+            chunks.append(Chunk(
+                text=chunk_text,
+                start_char_idx=start,
+                end_char_idx=end,
+                token_count=0,
+                metadata={}
+            ))
+            start = end
+        return chunks
+
+    def _cache_path_for_chunk(self, chunk_text: str) -> Path:
+        """Return a deterministic cache file path for a chunk based on its SHA256 hash.
+        Includes the few-shot block so that new human corrections invalidate old cache."""
+        cache_input = chunk_text + (self._few_shot_block or "")
+        hash_digest = hashlib.sha256(cache_input.encode('utf-8')).hexdigest()
+        cache_dir = Path(__file__).parent.parent / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / f"{hash_digest}.json"
+
+    def _load_cached_objects(self, cache_path: Path) -> List[ExtractedObject]:
+        """Load cached objects from a JSON file and return as ExtractedObject instances."""
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            objs = []
+            for item in data.get("objects", []):
+                objs.append(ExtractedObject(**item))
+            return objs
+        except Exception:
+            return []
+
+    def _save_objects_to_cache(self, cache_path: Path, objects: List[ExtractedObject]):
+        """Save a list of ExtractedObject instances to the given cache path as JSON."""
+        data = {"objects": [obj.dict() for obj in objects]}
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+
     def extract(self, text: str, note_id: str = "note_local", span_id: str = "span_full", chunks: Optional[List[Chunk]] = None) -> ExtractionResult:
+        """
+        The Master Orchestrator: Executes the 8-step pipeline to extract knowledge.
+        
+        This method is "Resilient": It can handle raw text directly, or work with 
+        pre-processed chunks. If chunks are provided but missing offsets, it 
+        re-calculates them locally to ensure every object is traceable.
+        
+        Args:
+            text: Raw unstructured text.
+            note_id: Source document ID for the database.
+            span_id: Default span ID if chunk-based mapping fails.
+            chunks: List of Chunk objects from the chunking pipeline.
+        """
+        # Prepare chunks (use provided or split)
+        if chunks is None:
+            chunks = self._split_into_chunks(text)
+
+        all_objects: List[ExtractedObject] = []
+        # Process each chunk, using cache when possible
+        for chunk in chunks:
+            cache_path = self._cache_path_for_chunk(chunk.text)
+            if cache_path.is_file():
+                cached_objs = self._load_cached_objects(cache_path)
+                if cached_objs:
+                    all_objects.extend(cached_objs)
+                    continue
+            # Not cached – run extraction on this chunk
+            objs = self._extract_batch(chunk.text)
+            if objs:
+                self._save_objects_to_cache(cache_path, objs)
+                all_objects.extend(objs)
+
+        if not all_objects:
+            print("[Extraction] ✗ No objects extracted.")
+            return ExtractionResult(objects=[], links=[], mentions=[])
+
+        # Deduplicate and re-number IDs
+        all_objects = self._deduplicate_objects(all_objects)
+
+        # Identify relationships across the full text
+        links = self._extract_relationships(text, all_objects)
+
+        # Build mentions linking objects to spans
+        mentions: List[ObjectMention] = []
+        for obj in all_objects:
+            resolved_span_id = span_id
+            if obj.span_start is not None:
+                for idx, chunk in enumerate(chunks):
+                    if chunk.start_char_idx <= obj.span_start <= chunk.end_char_idx:
+                        resolved_span_id = f"span_{idx:03d}"
+                        break
+            mentions.append(ObjectMention(
+                object_id=obj.id,
+                note_id=note_id,
+                span_id=resolved_span_id,
+                role="primary",
+                confidence=obj.confidence,
+            ))
+            self._save_to_objects_table(obj)
+
+        for link in links:
+            self._save_to_links_table(link)
+
+        # Ensure confidence scores are within [0.0, 1.0]
+        for obj in all_objects:
+            obj.confidence = max(0.0, min(1.0, obj.confidence))
+
+        # HITL: Log all extracted objects as 'pending' for human review
+        log_extraction(note_id, all_objects)
+
+        # Summary print
+        type_counts = {}
+        for obj in all_objects:
+            type_counts[obj.type] = type_counts.get(obj.type, 0) + 1
+        counts_str = ", ".join(f"{c} {t}{'s' if c != 1 else ''}" for t, c in type_counts.items())
+        few_shot_info = " (with few-shot examples)" if self._few_shot_block else " (zero-shot)"
+        print(f"[Extraction] ✓ Extracted {len(all_objects)} objects ({counts_str}), {len(links)} links  (model={self.model}){few_shot_info}")
+
+        return ExtractionResult(objects=all_objects, links=links, mentions=mentions)
         """
         The Master Orchestrator: Executes the 8-step pipeline to extract knowledge.
         
@@ -303,18 +443,37 @@ class LLMExtractor:
              print(f"  [Dedup] {len(all_objects)} → {len(deduped)} objects (removed {len(all_objects) - len(deduped)} duplicates)")
         return deduped
 
+    def _build_few_shot_block(self) -> str:
+        """
+        HITL: Build a few-shot prompt block from human-reviewed corrections.
+        Returns empty string if no feedback exists yet (graceful zero-shot fallback).
+        """
+        examples = get_few_shot_examples(limit=5)
+        block = format_few_shot_block(examples)
+        if block and self.verbose:
+            print(f"[HITL] Loaded {len(examples)} few-shot examples from feedback store")
+        return block
+
     def _extract_batch(self, text: str, is_retry: bool = False) -> List[ExtractedObject]:
         """
         Unified Pass (Steps 2-5): Extracts all knowledge objects in one LLM call.
         This optimizes for speed and cost while providing the model with full context.
         Includes built-in validation (Step 4) and regeneration (Step 5).
+
+        HITL Enhancement: If human feedback exists, injects few-shot examples into
+        the prompt to improve classification accuracy.
         """
         type_definitions_str = "\n".join([f"- {t}: {d}" for t, d in OBJECT_TYPE_DEFINITIONS.items()])
+
+        # HITL: Inject few-shot correction examples if available
+        few_shot_section = ""
+        if self._few_shot_block:
+            few_shot_section = f"\n{self._few_shot_block}\nNow extract objects from the following text:\n"
         
         user_prompt = f"""From the following text, extract all knowledge objects matching these definitions:
 
 {type_definitions_str}
-
+{few_shot_section}
 Text:
 \"\"\"
 {text}
